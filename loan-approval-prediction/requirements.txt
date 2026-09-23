@@ -8,3 +8,6 @@ jupyter>=1.1
 nbformat>=5.10
 nbconvert>=7.17
 ipykernel>=6.29
+mlflow>=3.16
+joblib>=1.5
+requests>=2.32
