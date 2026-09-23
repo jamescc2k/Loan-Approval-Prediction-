@@ -1,0 +1,5 @@
+mlflow==3.16.1
+lightgbm
+scikit-learn
+joblib
+pandas

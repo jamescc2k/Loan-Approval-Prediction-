@@ -17,6 +17,20 @@ CATEGORICAL_COLS = [
     "cb_person_default_on_file",
 ]
 
+# Categorías fijas conocidas (vienen así en el dataset de Kaggle). Las declaro a mano en
+# vez de inferirlas con pd.get_dummies porque necesito que el one-hot genere siempre las
+# mismas columnas, tanto si proceso 60k filas de train como si llega un único registro
+# por la API del modelo desplegado.
+HOME_OWNERSHIP_CATS = ["MORTGAGE", "OTHER", "OWN", "RENT"]
+LOAN_INTENT_CATS = ["DEBTCONSOLIDATION", "EDUCATION", "HOMEIMPROVEMENT", "MEDICAL", "PERSONAL", "VENTURE"]
+DEFAULT_ON_FILE_CATS = ["N", "Y"]
+
+ONE_HOT_SPECS = [
+    ("person_home_ownership", HOME_OWNERSHIP_CATS),
+    ("loan_intent", LOAN_INTENT_CATS),
+    ("cb_person_default_on_file", DEFAULT_ON_FILE_CATS),
+]
+
 # loan_grade es categórica pero tiene un orden natural de riesgo creciente (A = mejor, G = peor).
 GRADE_ORDER = {g: i for i, g in enumerate("ABCDEFG")}
 
@@ -66,6 +80,13 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["log_person_income"] = np.log1p(df["person_income"])
     df["log_loan_amnt"] = np.log1p(df["loan_amnt"])
 
+    # One-hot con categorías fijas: el modelo queda 100% numérico, así no depende del
+    # dtype "category" de pandas (que no sobrevive bien un viaje por JSON hasta el
+    # modelo servido con MLflow/Docker).
+    for col, cats in ONE_HOT_SPECS:
+        dummies = pd.get_dummies(pd.Categorical(df[col], categories=cats), prefix=col, dtype=int)
+        df = pd.concat([df, dummies], axis=1)
+
     return df
 
 
@@ -87,4 +108,5 @@ def feature_columns() -> list[str]:
         "log_person_income",
         "log_loan_amnt",
     ]
-    return NUMERIC_COLS + CATEGORICAL_COLS + engineered
+    one_hot_cols = [f"{col}_{cat}" for col, cats in ONE_HOT_SPECS for cat in cats]
+    return NUMERIC_COLS + engineered + one_hot_cols

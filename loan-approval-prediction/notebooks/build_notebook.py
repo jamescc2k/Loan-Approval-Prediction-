@@ -29,12 +29,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, RocCurveDisplay
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 
@@ -212,8 +211,14 @@ Para validar uso Stratified K-Fold con 5 folds, manteniendo la proporción de cl
 cada uno. Voy a probar dos cosas:
 
 1. Una regresión logística de referencia, para tener un piso con el que comparar.
-2. LightGBM, que suele ir bien en este tipo de datos tabulares y maneja las categóricas
-   sin que yo tenga que hacer one-hot a mano.
+2. LightGBM, que suele ir bien en este tipo de datos tabulares.
+
+Las tres categóricas (`person_home_ownership`, `loan_intent`, `cb_person_default_on_file`)
+ya llegan como columnas one-hot desde `feature_columns()` (categorías fijas, ver
+`src/features.py`), así que `X` queda 100% numérico desde el principio — nada de
+`categorical_feature` de LightGBM ni `OneHotEncoder` acá. Lo hice así a propósito: el
+tipo `category` de pandas no sobrevive bien el viaje por JSON cuando el modelo se sirve
+como API más adelante, y prefiero que el mismo dataframe le sirva a los dos modelos.
 """)
 
 code("""\
@@ -221,27 +226,16 @@ X = train[cols].copy()
 y = train[TARGET].values
 X_test = test[cols].copy()
 
-for c in CATEGORICAL_COLS:
-    X[c] = X[c].astype("category")
-    X_test[c] = X_test[c].astype("category")
-
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 """)
 
 md("### Regresión logística (referencia)")
 
 code("""\
-numeric_for_lr = [c for c in cols if c not in CATEGORICAL_COLS]
-
-preprocessor = ColumnTransformer([
-    ("num", StandardScaler(), numeric_for_lr),
-    ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_COLS),
-])
-
 lr_oof = np.zeros(len(X))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
     pipe = Pipeline([
-        ("prep", preprocessor),
+        ("scaler", StandardScaler()),
         ("clf", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
     ])
     pipe.fit(X.iloc[tr_idx], y[tr_idx])
@@ -274,7 +268,6 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
     model.fit(
         X.iloc[tr_idx], y[tr_idx],
         eval_X=X.iloc[va_idx], eval_y=y[va_idx],
-        categorical_feature=CATEGORICAL_COLS,
         callbacks=[early_stopping(100, verbose=False), log_evaluation(0)],
     )
     val_pred = model.predict_proba(X.iloc[va_idx])[:, 1]
@@ -365,6 +358,186 @@ y años de empleo, que corregí acotándolos. `loan_grade`, `loan_percent_income
 variables que más pesan a la hora de predecir si una solicitud queda marcada como riesgosa.
 
 LightGBM (AUC 0.9567 out-of-fold)
+""")
+
+md("## MLOps: tracking con MLflow y despliegue con Docker")
+
+md("""\
+Hasta acá todo quedó en el notebook, pero para la rama de MLOps necesito dos cosas más:
+que quede registrado en MLflow (params, métricas y el modelo en sí) y que el modelo se
+pueda llamar como una API real, corriendo dentro de un contenedor Docker.
+
+Toda la lógica de entrenamiento + logging a MLflow la tengo en `src/train.py` (así no
+la vuelvo a escribir acá encima); lo que hago en esta sección es correrla y mostrar qué
+queda registrado.
+""")
+
+md("### Entrenando y registrando en MLflow")
+
+md("""\
+`src/train.py` hace tres cosas y cada una queda como un run separado en el experimento
+`loan-approval-prediction`:
+
+1. `baseline-logreg` — la regresión logística de referencia.
+2. `lightgbm-cv` — la validación cruzada de LightGBM, con la métrica por fold.
+3. `lightgbm-final` — LightGBM reentrenado sobre el 100% del train, que es el que se
+   registra en el Model Registry (`loan-approval-lgbm`) y el que se guarda en `model/`
+   listo para servir.
+
+El tracking store es un sqlite (`mlflow.db`) en la raíz del proyecto, así da igual si
+corro esto desde el notebook o desde consola — todo cae en el mismo sitio y se ve junto
+en `mlflow ui`.
+""")
+
+code("""\
+import subprocess
+import sys
+
+result = subprocess.run(
+    [sys.executable, "train.py"],
+    cwd="../src",
+    capture_output=True,
+    text=True,
+)
+print(result.stdout[-1500:])
+if result.returncode != 0:
+    print(result.stderr[-2000:])
+""")
+
+md("""\
+Y así se ven los runs que acabo de generar, consultándolos directamente con el cliente
+de MLflow (lo mismo que se ve, con más detalle visual, en `mlflow ui`):
+""")
+
+code("""\
+import mlflow
+
+mlflow.set_tracking_uri("sqlite:///../mlflow.db")
+client = mlflow.MlflowClient()
+
+experiment = client.get_experiment_by_name("loan-approval-prediction")
+runs = client.search_runs([experiment.experiment_id], order_by=["start_time DESC"])
+
+runs_df = pd.DataFrame([
+    {"run_name": r.data.tags.get("mlflow.runName"), **r.data.metrics}
+    for r in runs
+])
+runs_df
+""")
+
+md("""\
+Para ver esto mismo con gráficos y comparando runs entre sí, se levanta la UI de MLflow
+con:
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+y se abre en `http://127.0.0.1:5000`.
+""")
+
+md("### Despliegue con Docker")
+
+md("""\
+El `Dockerfile` (en la raíz del proyecto) no entrena nada — solo empaqueta el modelo que
+ya quedó guardado en `model/` junto con lo mínimo para servirlo, y arranca
+`mlflow models serve` al levantar el contenedor. Los pasos son:
+
+```bash
+# 1. Construir la imagen
+docker build -t loan-approval-api .
+
+# 2. Levantar el contenedor, publicando el puerto 5000
+docker run -p 5000:5000 loan-approval-api
+```
+
+Con eso, el contenedor queda escuchando en `http://localhost:5000/invocations`, que es
+el endpoint estándar que expone MLflow para pedir predicciones.
+
+*Nota: en el entorno donde escribí este notebook no tengo Docker instalado, así que no
+pude hacer el `docker build` real. Lo que sí hice fue levantar el mismo servidor
+(`mlflow models serve`, el comando exacto que corre el `CMD` del Dockerfile) directamente
+en esta máquina para probar que el endpoint funciona de verdad — es el mismo proceso que
+correría dentro del contenedor, solo que sin la capa de Docker encima.*
+""")
+
+md("### Probando el modelo desplegado")
+
+md("""\
+Levanto el servidor (el mismo comando que usa el Dockerfile) como subproceso, espero a
+que responda, y le mando una solicitud real con tres registros de test para que devuelva
+la probabilidad de aprobación de cada uno.
+""")
+
+code("""\
+import os
+import site
+import subprocess
+import sys
+import time
+
+# El instalador de pip dejó los ejecutables (mlflow, uvicorn) en la carpeta Scripts del
+# usuario, que no está en el PATH por defecto en esta máquina — la agrego para este
+# subproceso.
+scripts_dir = os.path.join(os.path.dirname(site.getusersitepackages()), "Scripts")
+env = os.environ.copy()
+env["PATH"] = scripts_dir + os.pathsep + env.get("PATH", "")
+env["MLFLOW_TRACKING_URI"] = "sqlite:///../mlflow.db"
+
+server = subprocess.Popen(
+    ["mlflow", "models", "serve", "-m", "../model", "--host", "127.0.0.1", "--port", "5001",
+     "--env-manager", "local"],
+    cwd=".",
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+""")
+
+code("""\
+import requests
+
+server_ready = False
+for _ in range(30):
+    try:
+        if requests.get("http://127.0.0.1:5001/ping", timeout=2).status_code == 200:
+            server_ready = True
+            break
+    except requests.exceptions.ConnectionError:
+        pass
+    time.sleep(2)
+
+print("Servidor arriba:" if server_ready else "El servidor no respondió a tiempo", server_ready)
+""")
+
+code("""\
+# Tres solicitudes reales de test.csv, procesadas con el mismo pipeline de features
+# que usa el modelo (build_model_frame + feature_columns), tal como llegarían en
+# producción.
+sample = build_model_frame(test_raw.head(3))
+X_sample = sample[cols]
+
+payload = {"dataframe_split": {"columns": cols, "data": X_sample.values.tolist()}}
+
+response = requests.post("http://127.0.0.1:5001/invocations", json=payload)
+print("Status:", response.status_code)
+print("Predicciones (probabilidad de aprobación):", response.json())
+""")
+
+md("""\
+Ahí está: el endpoint devuelve la probabilidad de aprobación para cada solicitud
+(`predict_proba`, no solo la clase 0/1), que es el mismo tipo de score que usé para
+armar el submission. Cierro el servidor de prueba para no dejarlo corriendo de fondo.
+""")
+
+code("""\
+server.terminate()
+try:
+    server.wait(timeout=10)
+except subprocess.TimeoutExpired:
+    server.kill()
+print("Servidor de prueba detenido.")
 """)
 
 nb["cells"] = cells
